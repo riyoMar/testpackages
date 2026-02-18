@@ -1,0 +1,150 @@
+#!/bin/sh
+
+# parameters
+INTERFACE=$1
+# TIMES=$2
+DIFF_PERCENTAGE=$2
+MIN_RX=$3
+MIN_TX=$4
+
+
+# get current data transfer sizes
+rx() {
+    awk -v INTERFACE="$INTERFACE" '$1 == INTERFACE ":" {print $2}' /proc/net/dev
+}
+
+tx() {
+    awk -v INTERFACE="$INTERFACE" '$1 == INTERFACE ":" {print $10}' /proc/net/dev
+}
+
+
+# change from bytes to kbits
+measure_kbps() {
+    local INTERVAL=${1:-1}
+
+    local RX1=$(rx)
+    local TX1=$(tx)
+
+    sleep "$INTERVAL"
+
+    local RX2=$(rx)
+    local TX2=$(tx)
+
+    # Protect against counter wrap
+    if [ "$RX2" -lt "$RX1" ]; then
+        RX_DIFF=0
+    else
+        RX_DIFF=$((RX2 - RX1))
+    fi
+
+    if [ "$TX2" -lt "$TX1" ]; then
+        TX_DIFF=0
+    else
+        TX_DIFF=$((TX2 - TX1))
+    fi
+
+    RX_KBPS=$((RX_DIFF * 8 / 1000 / INTERVAL))
+    TX_KBPS=$((TX_DIFF * 8 / 1000 / INTERVAL))
+}
+
+
+# check mirroring cause tc qdisc just setup for egress
+modprobe ifb 2>/dev/null
+ip link show "ifb_${INTERFACE}" >/dev/null 2>&1 || ip link add "ifb_${INTERFACE}" type ifb
+ip link set "ifb_${INTERFACE}" up
+
+
+# cake setup
+apply_cake() {
+    DL=$1
+    UL=$2
+
+    # Upload (egress)
+    tc qdisc replace dev "$INTERFACE" root cake bandwidth ${UL}kbit \
+        besteffort triple-isolate rtt 100ms
+
+    # Ensure ingress exists
+    tc qdisc show dev "$INTERFACE" | grep -q "ingress ffff:" || \
+        tc qdisc add dev "$INTERFACE" handle ffff: ingress
+
+    # Ensure redirect exists
+    tc filter show dev "$INTERFACE" | grep -q "mirred" || \
+        tc filter add dev "$INTERFACE" parent ffff: \
+            protocol all u32 match u32 0 0 \
+            action mirred egress redirect dev "ifb_${INTERFACE}"
+
+    # Download (ingress)
+    tc qdisc replace dev "ifb_${INTERFACE}" root cake bandwidth ${DL}kbit \
+        besteffort triple-isolate rtt 100ms
+}
+
+
+
+# check diff% for update
+LAST_DL=0
+LAST_UL=0
+diff_update() {
+    local PERCENTAGE=${1:-5}
+
+    measure_kbps 1
+
+    echo "Current → RX:${RX_KBPS}kbit TX:${TX_KBPS}kbit"
+
+    # If no previous value, just initialize and apply once
+    if [ "$LAST_DL" -eq 0 ] || [ "$LAST_UL" -eq 0 ]; then
+        LAST_DL=${MIN_RX:-3000} # using 3Mbits as default
+        LAST_UL=${MIN_TX:-3000}
+
+        # LAST_DL=$RX_KBPS
+        # LAST_UL=$TX_KBPS
+
+        echo "Initial CAKE → DL:${LAST_DL}kbit UL:${LAST_UL}kbit"
+        apply_cake "$LAST_DL" "$LAST_UL"
+        return
+    fi
+
+    # Avoid division if last value is 0
+    if [ "$LAST_DL" -gt 0 ]; then
+        DL_DIFF=$(awk -v a="$RX_KBPS" -v b="$LAST_DL" \
+    'BEGIN { if (b>0) printf "%d", ((a-b)/b)*100; else print 0 }')
+        # DL_DIFF=$(( (RX_KBPS - LAST_DL) * 100 / LAST_DL ))
+        [ "$DL_DIFF" -lt 0 ] && DL_DIFF=$(( -DL_DIFF ))
+    else
+        DL_DIFF=0
+    fi
+
+    if [ "$LAST_UL" -gt 0 ]; then
+        UL_DIFF=$(awk -v a="$TX_KBPS" -v b="$LAST_UL" \
+    'BEGIN { if (b>0) printf "%d", ((a-b)/b)*100; else print 0 }')
+        # UL_DIFF=$(( (TX_KBPS - LAST_UL) * 100 / LAST_UL ))
+        [ "$UL_DIFF" -lt 0 ] && UL_DIFF=$(( -UL_DIFF ))
+    else
+        UL_DIFF=0
+    fi
+
+    # add here just if grater than min rx & tx then update
+    # Enforce minimum bandwidth floor
+    NEW_DL=$RX_KBPS
+    NEW_UL=$TX_KBPS
+
+    # If measured is below minimum, clamp it
+    [ "$NEW_DL" -lt "$MIN_RX" ] && NEW_DL=$MIN_RX
+    [ "$NEW_UL" -lt "$MIN_TX" ] && NEW_UL=$MIN_TX
+
+
+    if [ "$DL_DIFF" -ge "$PERCENTAGE" ] || \
+       [ "$UL_DIFF" -ge "$PERCENTAGE" ]; then
+
+        echo "Updating CAKE → DL:${NEW_DL}kbps UL:${NEW_UL}kbps"
+
+        apply_cake "$NEW_DL" "$NEW_UL"
+
+        LAST_DL=$NEW_DL
+        LAST_UL=$NEW_UL
+    fi
+}
+
+
+while true; do
+    diff_update "$DIFF_PERCENTAGE"
+done

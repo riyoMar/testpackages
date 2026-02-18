@@ -1,11 +1,25 @@
 #!/bin/sh
 
-IFACE="phy0-sta0"
-IFB="ifb4phy0-sta0"
+# ===============================
+# Parameters
+# ===============================
 
-INTERVAL=${1:-3}     # seconds
-SAFETY=92            # percent of peak bandwidth                # best 70
-REAPPLY_DELTA=10     # percent change required to reapply CAKE  # best 5
+IFACE=${1:-phy0-sta0}
+INTERVAL=${2:-3}
+MIN_DL_KBIT=${3:-3000}
+MIN_UL_KBIT=${4:-1000}
+SAFETY=${5:-70}
+REAPPLY_DELTA=${6:-5}
+
+IFB="ifb_${IFACE}"
+
+# Convert minimum to bps
+MIN_DL=$((MIN_DL_KBIT * 1000))
+MIN_UL=$((MIN_UL_KBIT * 1000))
+
+# ===============================
+# Helpers
+# ===============================
 
 rx() { awk -v IF="$IFACE" '$1 == IF ":" {print $2}' /proc/net/dev; }
 tx() { awk -v IF="$IFACE" '$1 == IF ":" {print $10}' /proc/net/dev; }
@@ -30,50 +44,73 @@ apply_cake() {
     echo " Download: $(format_rate $DL)"
     echo " Upload  : $(format_rate $UL)"
 
-    tc qdisc del dev $IFACE root 2>/dev/null
-    tc qdisc del dev $IFACE ingress 2>/dev/null
-    tc qdisc del dev $IFB root 2>/dev/null
+    tc qdisc del dev "$IFACE" root 2>/dev/null
+    tc qdisc del dev "$IFACE" ingress 2>/dev/null
+    tc qdisc del dev "$IFB" root 2>/dev/null
 
     # Upload (egress)
-    tc qdisc add dev $IFACE root cake bandwidth ${UL}bps \
+    tc qdisc add dev "$IFACE" root cake bandwidth ${UL}bit \
         besteffort triple-isolate rtt 100ms
 
     # Ingress redirect
-    tc qdisc add dev $IFACE handle ffff: ingress
-    tc filter add dev $IFACE parent ffff: \
+    tc qdisc add dev "$IFACE" handle ffff: ingress
+    tc filter add dev "$IFACE" parent ffff: \
         protocol all u32 match u32 0 0 \
-        action mirred egress redirect dev $IFB
+        action mirred egress redirect dev "$IFB"
 
     # Download (ingress)
-    tc qdisc add dev $IFB root cake bandwidth ${DL}bps \
+    tc qdisc add dev "$IFB" root cake bandwidth ${DL}bit \
         besteffort triple-isolate rtt 100ms
 }
 
+# ===============================
 # Setup IFB
-modprobe ifb
-ip link show $IFB >/dev/null 2>&1 || ip link add $IFB type ifb
-ip link set $IFB up
+# ===============================
+
+modprobe ifb 2>/dev/null
+ip link show "$IFB" >/dev/null 2>&1 || ip link add "$IFB" type ifb
+ip link set "$IFB" up
 
 MAX_RX=0
 MAX_TX=0
 APPLIED_DL=0
 APPLIED_UL=0
 
-echo "Starting continuous CAKE auto-tuning (interval: ${INTERVAL}s)"
+echo "Starting CAKE auto-tuning"
+echo " Interface      : $IFACE"
+echo " IFB            : $IFB"
+echo " Interval       : ${INTERVAL}s"
+echo " Min DL         : ${MIN_DL_KBIT} Kbit"
+echo " Min UL         : ${MIN_UL_KBIT} Kbit"
+echo " Safety         : ${SAFETY}%"
+echo " Reapply delta  : ${REAPPLY_DELTA}%"
+
+# ===============================
+# Main Loop
+# ===============================
 
 while true; do
     RX1=$(rx); TX1=$(tx)
-    sleep $INTERVAL
+    sleep "$INTERVAL"
     RX2=$(rx); TX2=$(tx)
 
     RX_BPS=$(( (RX2 - RX1) * 8 / INTERVAL ))
     TX_BPS=$(( (TX2 - TX1) * 8 / INTERVAL ))
 
+    # Protect against counter wrap
+    [ "$RX_BPS" -lt 0 ] && RX_BPS=0
+    [ "$TX_BPS" -lt 0 ] && TX_BPS=0
+
+    # Track peak
     [ "$RX_BPS" -gt "$MAX_RX" ] && MAX_RX=$RX_BPS
     [ "$TX_BPS" -gt "$MAX_TX" ] && MAX_TX=$TX_BPS
 
     DL=$(( MAX_RX * SAFETY / 100 ))
     UL=$(( MAX_TX * SAFETY / 100 ))
+
+    # Enforce minimum limits
+    [ "$DL" -lt "$MIN_DL" ] && DL=$MIN_DL
+    [ "$UL" -lt "$MIN_UL" ] && UL=$MIN_UL
 
     printf "\nMeasured over %ds:\n" "$INTERVAL"
     printf " Ingress now : %s\n" "$(format_rate $RX_BPS)"
@@ -81,7 +118,7 @@ while true; do
     printf " Peak RX     : %s\n" "$(format_rate $MAX_RX)"
     printf " Peak TX     : %s\n" "$(format_rate $MAX_TX)"
 
-    # Apply CAKE first time
+    # First apply
     if [ "$APPLIED_DL" -eq 0 ]; then
         apply_cake "$DL" "$UL"
         APPLIED_DL=$DL
@@ -89,14 +126,14 @@ while true; do
         continue
     fi
 
-    # Check if bandwidth changed significantly
     DIFF_DL=$(( (DL - APPLIED_DL) * 100 / APPLIED_DL ))
     DIFF_UL=$(( (UL - APPLIED_UL) * 100 / APPLIED_UL ))
 
     [ "$DIFF_DL" -lt 0 ] && DIFF_DL=$(( -DIFF_DL ))
     [ "$DIFF_UL" -lt 0 ] && DIFF_UL=$(( -DIFF_UL ))
 
-    if [ "$DIFF_DL" -ge "$REAPPLY_DELTA" ] || [ "$DIFF_UL" -ge "$REAPPLY_DELTA" ]; then
+    if [ "$DIFF_DL" -ge "$REAPPLY_DELTA" ] || \
+       [ "$DIFF_UL" -ge "$REAPPLY_DELTA" ]; then
         echo
         echo "Bandwidth changed significantly, reapplying CAKE..."
         apply_cake "$DL" "$UL"

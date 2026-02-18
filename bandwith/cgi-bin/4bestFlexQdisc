@@ -1,0 +1,114 @@
+#!/bin/sh
+
+# ==============================
+# PARAMETERS
+# ==============================
+
+IFACE=${1}
+INTERVAL=${2:-3}
+MIN_DL_KBIT=${3:-3000}
+MIN_UL_KBIT=${4:-1000}
+TARGET=${5:-8.8.8.8}
+
+IFB="ifb_${IFACE}"
+
+MIN_DL=$((MIN_DL_KBIT * 1000))
+MIN_UL=$((MIN_UL_KBIT * 1000))
+
+# Initial guess (start higher than minimum)
+CUR_DL=$((MIN_DL * 2))
+CUR_UL=$((MIN_UL * 2))
+
+STEP_UP=3        # % increase when stable
+STEP_DOWN=15     # % decrease when bloated
+LATENCY_THRESH=15  # ms above base considered bloat
+
+# ==============================
+# RTT FUNCTIONS
+# ==============================
+
+get_rtt() {
+    ping -c 3 -W 1 $TARGET 2>/dev/null | \
+    awk -F'/' '/rtt/ {print int($5)}'
+}
+
+# ==============================
+# CAKE APPLY
+# ==============================
+
+apply_cake() {
+    DL=$1
+    UL=$2
+
+    tc qdisc del dev "$IFACE" root 2>/dev/null
+    tc qdisc del dev "$IFACE" ingress 2>/dev/null
+    tc qdisc del dev "$IFB" root 2>/dev/null
+
+    tc qdisc add dev "$IFACE" root cake bandwidth ${UL}bps \
+        besteffort triple-isolate rtt 100ms
+
+    tc qdisc add dev "$IFACE" handle ffff: ingress
+    tc filter add dev "$IFACE" parent ffff: \
+        protocol all u32 match u32 0 0 \
+        action mirred egress redirect dev "$IFB"
+
+    tc qdisc add dev "$IFB" root cake bandwidth ${DL}bps \
+        besteffort triple-isolate rtt 100ms
+
+    echo "CAKE set → DL=$((DL/1000))Kbit UL=$((UL/1000))Kbit"
+}
+
+# ==============================
+# SETUP IFB
+# ==============================
+
+modprobe ifb 2>/dev/null
+ip link show "$IFB" >/dev/null 2>&1 || ip link add "$IFB" type ifb
+ip link set "$IFB" up
+
+echo "Measuring base latency..."
+sleep 2
+BASE_RTT=$(get_rtt)
+
+[ -z "$BASE_RTT" ] && BASE_RTT=20
+
+echo "Base RTT: ${BASE_RTT} ms"
+
+apply_cake "$CUR_DL" "$CUR_UL"
+
+# ==============================
+# CONTROL LOOP
+# ==============================
+
+while true; do
+    sleep "$INTERVAL"
+
+    RTT=$(get_rtt)
+    [ -z "$RTT" ] && continue
+
+    DIFF=$((RTT - BASE_RTT))
+
+    echo "RTT: ${RTT} ms (Δ ${DIFF})"
+
+    if [ "$DIFF" -gt "$LATENCY_THRESH" ]; then
+        # Bufferbloat detected → decrease fast
+        CUR_DL=$((CUR_DL * (100 - STEP_DOWN) / 100))
+        CUR_UL=$((CUR_UL * (100 - STEP_DOWN) / 100))
+
+        [ "$CUR_DL" -lt "$MIN_DL" ] && CUR_DL=$MIN_DL
+        [ "$CUR_UL" -lt "$MIN_UL" ] && CUR_UL=$MIN_UL
+
+        echo "Bufferbloat detected → decreasing rate"
+
+        apply_cake "$CUR_DL" "$CUR_UL"
+
+    else
+        # Latency clean → increase slowly
+        CUR_DL=$((CUR_DL * (100 + STEP_UP) / 100))
+        CUR_UL=$((CUR_UL * (100 + STEP_UP) / 100))
+
+        echo "Latency stable → increasing rate"
+
+        apply_cake "$CUR_DL" "$CUR_UL"
+    fi
+done

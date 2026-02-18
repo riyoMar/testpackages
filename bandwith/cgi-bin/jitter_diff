@@ -1,0 +1,5 @@
+#!/bin/sh
+
+# change the bandwith with jitter, instead using times
+
+# need target ip
