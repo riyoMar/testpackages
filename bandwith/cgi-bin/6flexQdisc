@@ -1,0 +1,137 @@
+#!/bin/sh
+
+IFACE="${1}"                    # interface
+IFB="ifb_${IFACE}"              # IFB mirror
+
+INTERVAL=${2:-5}                # seconds
+SAFETY=${3:-70}                 # % of estimated bandwidth
+
+UP_DELTA=5                      # % increase trigger
+DOWN_DELTA=5                   # % decrease trigger
+
+MIN_DL=1000000                  # 1 Mbps floor
+MIN_UL=500000                   # 0.5 Mbps floor
+
+ALPHA=10                        # EMA smoothing factor (0–100)
+
+rx() { cat /sys/class/net/$IFACE/statistics/rx_bytes; }
+tx() { cat /sys/class/net/$IFACE/statistics/tx_bytes; }
+
+format_rate() {
+    v=$1
+    if [ "$v" -ge 1000000 ]; then
+        awk "BEGIN{printf \"%.2f Mbit/s\", $v/1000000}"
+    elif [ "$v" -ge 1000 ]; then
+        awk "BEGIN{printf \"%.2f Kbit/s\", $v/1000}"
+    else
+        printf "%d bit/s" "$v"
+    fi
+}
+
+apply_cake() {
+    DL=$1
+    UL=$2
+
+    echo
+    echo "Applying CAKE:"
+    echo " Download: $(format_rate $DL)"
+    echo " Upload  : $(format_rate $UL)"
+
+    tc qdisc del dev $IFACE root 2>/dev/null
+    tc qdisc del dev $IFACE ingress 2>/dev/null
+    tc qdisc del dev $IFB root 2>/dev/null
+
+    # Upload (egress)
+    tc qdisc add dev $IFACE root cake bandwidth ${UL}bps \
+        besteffort triple-isolate rtt 100ms
+
+    # Ingress redirect
+    tc qdisc add dev $IFACE handle ffff: ingress
+    tc filter add dev $IFACE parent ffff: \
+        protocol all u32 match u32 0 0 \
+        action mirred egress redirect dev $IFB
+
+    # Download (ingress via IFB)
+    tc qdisc add dev $IFB root cake bandwidth ${DL}bps \
+        besteffort triple-isolate rtt 100ms
+}
+
+# Setup IFB
+modprobe ifb
+ip link show $IFB >/dev/null 2>&1 || ip link add $IFB type ifb
+ip link set $IFB up
+
+AVG_RX=0
+AVG_TX=0
+APPLIED_DL=0
+APPLIED_UL=0
+
+echo "Starting CAKE auto-tuning on $IFACE (interval=${INTERVAL}s, safety=${SAFETY}%)"
+
+while true; do
+    RX1=$(rx); TX1=$(tx)
+    sleep $INTERVAL
+    RX2=$(rx); TX2=$(tx)
+
+    RX_BPS=$(( (RX2 - RX1) * 8 / INTERVAL ))
+    TX_BPS=$(( (TX2 - TX1) * 8 / INTERVAL ))
+
+    # --- EMA smoothing ---
+    if [ "$AVG_RX" -eq 0 ]; then
+        AVG_RX=$RX_BPS
+        AVG_TX=$TX_BPS
+    else
+        AVG_RX=$(( (ALPHA * RX_BPS + (100 - ALPHA) * AVG_RX) / 100 ))
+        AVG_TX=$(( (ALPHA * TX_BPS + (100 - ALPHA) * AVG_TX) / 100 ))
+    fi
+
+    DL=$(( AVG_RX * SAFETY / 100 ))
+    UL=$(( AVG_TX * SAFETY / 100 ))
+
+    # --- Minimum bandwidth protection ---
+    [ "$DL" -lt "$MIN_DL" ] && DL=$MIN_DL
+    [ "$UL" -lt "$MIN_UL" ] && UL=$MIN_UL
+
+    printf "\nMeasured (%ds):\n" "$INTERVAL"
+    printf " RX now : %s\n" "$(format_rate $RX_BPS)"
+    printf " TX now : %s\n" "$(format_rate $TX_BPS)"
+    printf " AVG RX : %s\n" "$(format_rate $AVG_RX)"
+    printf " AVG TX : %s\n" "$(format_rate $AVG_TX)"
+
+    # First apply
+    if [ "$APPLIED_DL" -eq 0 ]; then
+        apply_cake "$DL" "$UL"
+        APPLIED_DL=$DL
+        APPLIED_UL=$UL
+        continue
+    fi
+
+    CHANGE=0
+
+    # --- Download decision ---
+    if [ "$DL" -gt "$APPLIED_DL" ]; then
+        DIFF_DL=$(( (DL - APPLIED_DL) * 100 / APPLIED_DL ))
+        [ "$DIFF_DL" -ge "$UP_DELTA" ] && CHANGE=1
+    else
+        DIFF_DL=$(( (APPLIED_DL - DL) * 100 / APPLIED_DL ))
+        [ "$DIFF_DL" -ge "$DOWN_DELTA" ] && CHANGE=1
+    fi
+
+    # --- Upload decision ---
+    if [ "$UL" -gt "$APPLIED_UL" ]; then
+        DIFF_UL=$(( (UL - APPLIED_UL) * 100 / APPLIED_UL ))
+        [ "$DIFF_UL" -ge "$UP_DELTA" ] && CHANGE=1
+    else
+        DIFF_UL=$(( (APPLIED_UL - UL) * 100 / APPLIED_UL ))
+        [ "$DIFF_UL" -ge "$DOWN_DELTA" ] && CHANGE=1
+    fi
+
+    # --- Apply if needed ---
+    if [ "$CHANGE" -eq 1 ]; then
+        echo
+        echo "Significant bandwidth change detected → reapplying CAKE"
+        apply_cake "$DL" "$UL"
+        APPLIED_DL=$DL
+        APPLIED_UL=$UL
+    fi
+done
