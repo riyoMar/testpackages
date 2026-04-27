@@ -1,0 +1,11 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+
+start() {
+    /root/flexQdisc >/dev/null 2>&1 &
+}
+
+stop() {
+    killall flexQdisc
+}

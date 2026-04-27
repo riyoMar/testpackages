@@ -1,6 +1,6 @@
 #!/bin/sh
 
-IFACE="${1:-phy0-sta0}"                    # interface
+IFACE="${1:-phy0-sta0}"         # interface
 IFB="ifb_${IFACE}"              # IFB mirror
 
 INTERVAL=${2:-5}                # seconds
@@ -9,7 +9,7 @@ SAFETY=${3:-70}                 # % of estimated bandwidth
 UP_DELTA=5                      # % increase trigger
 DOWN_DELTA=5                   # % decrease trigger
 
-MIN_DL=1000000                  # 1 Mbps floor
+MIN_DL=500000                  # 1 Mbps floor
 MIN_UL=500000                   # 0.5 Mbps floor
 
 ALPHA=10                        # EMA smoothing factor (0–100)
