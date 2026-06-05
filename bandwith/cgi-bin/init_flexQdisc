@@ -3,12 +3,10 @@
 START=99
 
 start() {
-    /root/flexQdisc >/dev/null 2>&1 &
+    /usr/bin/flex-qdisc >/dev/null 2>&1 &
 }
 
 stop() {
-    #!/bin/sh
-
     IFACE="${1:-phy0-sta0}"
     IFB="ifb_$IFACE"
 
@@ -20,5 +18,5 @@ stop() {
     ip link del ${IFB} 2>/dev/null
 
 
-    killall flexQdisc 2>/dev/null
+    killall flex-qdisc 2>/dev/null
 }
