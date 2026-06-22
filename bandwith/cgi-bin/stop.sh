@@ -10,4 +10,5 @@ tc qdisc del dev "${IFB}" root 2>/dev/null
 ip link set "${IFB}" down 2>/dev/null
 ip link del "${IFB}" 2>/dev/null
 
-echo "flex-qdisc stopped on ${IFACE}"
+echo "flex-qdisc stopped on device ${IFACE}!"
+echo

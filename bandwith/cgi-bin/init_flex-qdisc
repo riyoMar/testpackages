@@ -2,9 +2,10 @@
 
 USE_PROCD=1
 
+. /lib/functions.sh
+
 START=99
 
-extra_command "watch" "Watch currently configuration setups"
 extra_command "remove" "Uninstall the program"
 
 CONFIGURATION=flex-qdisc
@@ -12,14 +13,10 @@ CONFIGURATION=flex-qdisc
 start_service() {
     # Reading config
     config_load "${CONFIGURATION}"
-    local device
-    local interval
-    local safety
-    local download
-    local upload
-    local alpha
-    local delta_download
-    local delta_upload
+    
+    local device interval safety
+    local download upload alpha
+    local delta_download delta_upload
 
     config_get device default device    
     config_get interval default interval    
@@ -30,9 +27,10 @@ start_service() {
     config_get delta_download default delta_download    
     config_get delta_upload default delta_upload
 
-    # /etc/flex-qdisc/start >/dev/null 2>&1 &
+    procd_open_instance
 
-    /etc/flex-qdisc/"${CONFIGURATION}" \
+    procd_set_param command \
+        /etc/flex-qdisc/flex-qdisc \
         "$device" \
         "$interval" \
         "$safety" \
@@ -40,8 +38,11 @@ start_service() {
         "$upload" \
         "$alpha" \
         "$delta_download" \
-        "$delta_upload" \
-        >/dev/null 2>&1 &
+        "$delta_upload"
+
+    procd_set_param respawn
+
+    procd_close_instance
 
     echo "Success flex-qdisc config setup!";
     echo
@@ -52,62 +53,10 @@ stop_service() {
     config_load "${CONFIGURATION}"
     
     local device
-    config_get device default device
 
     /etc/flex-qdisc/stop "$device"
 
-    killall flex-qdisc 2>/dev/null
-}
-
-watch() {
-    local STATE_FILE="/tmp/flex-qdisc.state"
-
-    config_load "${CONFIGURATION}"
-
-    local device interval safety
-    local download upload alpha
-    local delta_download delta_upload
-
     config_get device default device
-    config_get interval default interval
-    config_get safety default safety
-    config_get download default download
-    config_get upload default upload
-    config_get alpha default alpha
-    config_get delta_download default delta_download
-    config_get delta_upload default delta_upload
-
-    echo
-    echo "=== Configured Values ==="
-    echo "Device          : $device"
-    echo "Interval        : $interval"
-    echo "Safety          : $safety"
-    echo "Download Floor  : ${download} Kbit"
-    echo "Upload Floor    : ${upload} Kbit"
-    echo "Alpha           : $alpha"
-    echo "Delta Download  : $delta_download%"
-    echo "Delta Upload    : $delta_upload%"
-
-    echo
-    echo "=== Last Applied ==="
-
-    if [ -f "$STATE_FILE" ]; then
-        . "$STATE_FILE"
-
-        echo "Time            : $TIME"
-        echo "Download        : $DL bps"
-        echo "Upload          : $UL bps"
-    else
-        echo "No applied state found."
-    fi
-
-    echo
-    echo "=== Current CAKE ==="
-    tc -s qdisc show dev "$device"
-
-    echo
-    echo "=== Current IFB CAKE ==="
-    tc -s qdisc show dev "ifb_$device"
 }
 
 remove() {
