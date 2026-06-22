@@ -18,6 +18,8 @@ ALPHA=${6:-10}                          # EMA smoothing factor (0–100)
 UP_DELTA=${7:-5}                        # % increase trigger
 DOWN_DELTA=${8:-5}                      # % decrease trigger
 
+STATE_FILE="/tmp/flex-qdisc.state"
+
 
 rx() { cat /sys/class/net/$DEVICE/statistics/rx_bytes; }
 tx() { cat /sys/class/net/$DEVICE/statistics/tx_bytes; }
@@ -33,30 +35,55 @@ format_rate() {
     fi
 }
 
+# apply_cake() {
+#     DL=$1
+#     UL=$2
+
+#     echo
+#     echo "Applying CAKE:"
+#     echo " Download: $(format_rate $DL)"
+#     echo " Upload  : $(format_rate $UL)"
+
+#     tc qdisc del dev $DEVICE root 2>/dev/null
+#     tc qdisc del dev $DEVICE ingress 2>/dev/null
+#     tc qdisc del dev $IFB root 2>/dev/null
+
+#     # Upload (egress)
+#     tc qdisc add dev $DEVICE root cake bandwidth ${UL}bps \
+#         besteffort triple-isolate rtt 100ms
+
+#     # Ingress redirect
+#     tc qdisc add dev $DEVICE handle ffff: ingress
+#     tc filter add dev $DEVICE parent ffff: \
+#         protocol all u32 match u32 0 0 \
+#         action mirred egress redirect dev $IFB
+
+#     # Download (ingress via IFB)
+#     tc qdisc add dev $IFB root cake bandwidth ${DL}bps \
+#         besteffort triple-isolate rtt 100ms
+# }
+
 apply_cake() {
     DL=$1
     UL=$2
 
-    echo
-    echo "Applying CAKE:"
-    echo " Download: $(format_rate $DL)"
-    echo " Upload  : $(format_rate $UL)"
+    echo "DL=$DL" > "$STATE_FILE"
+    echo "UL=$UL" >> "$STATE_FILE"
+    echo "TIME=$(date '+%Y-%m-%d %H:%M:%S')" >> "$STATE_FILE"
 
     tc qdisc del dev $DEVICE root 2>/dev/null
     tc qdisc del dev $DEVICE ingress 2>/dev/null
     tc qdisc del dev $IFB root 2>/dev/null
 
-    # Upload (egress)
     tc qdisc add dev $DEVICE root cake bandwidth ${UL}bps \
         besteffort triple-isolate rtt 100ms
 
-    # Ingress redirect
     tc qdisc add dev $DEVICE handle ffff: ingress
+
     tc filter add dev $DEVICE parent ffff: \
         protocol all u32 match u32 0 0 \
         action mirred egress redirect dev $IFB
 
-    # Download (ingress via IFB)
     tc qdisc add dev $IFB root cake bandwidth ${DL}bps \
         besteffort triple-isolate rtt 100ms
 }
